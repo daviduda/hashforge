@@ -3,12 +3,15 @@
 #include<shellapi.h>
 #include<wincred.h>
 #include<bcrypt.h>
-#include<locale.h>
 #include<wchar.h>
 
+#pragma comment(lib, "kernel32.lib")
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "credui.lib")
 #pragma comment(lib, "bcrypt.lib")
+
+static WCHAR username[CREDUI_MAX_USERNAME_LENGTH + 1];
+static WCHAR password[CREDUI_MAX_PASSWORD_LENGTH + 1];
 
 static BOOL WriteAll(HANDLE hFile, PUCHAR pbData, DWORD cbData) {
 	DWORD cbWritten;
@@ -59,6 +62,66 @@ static void PrintErrorStatus(NTSTATUS status, LPCSTR src) {
 		WriteAll(GetStdHandle(STD_ERROR_HANDLE), pbMessage, cbMessage);
 	}
 	LocalFree(pbMessage);
+}
+
+static DWORD ParseUint(LPCWSTR n) {
+	WCHAR b = 10, c, d;
+	DWORD x = 0, cutoff, cutlim;
+	c = *n;
+	while (1) {
+		switch (c) {
+		case L' ':
+		case L'\t':
+		case L'\n':
+		case L'\r':
+		case L'\f':
+		case L'\v':
+			c = *++n;
+			continue;
+		case L'\0':
+			return 0;
+		}
+		break;
+	}
+	if (c == L'0') {
+		switch (c = *++n) {
+		case L'x':
+		case L'X':
+			b = 16;
+			c = *++n;
+			break;
+		case L'b':
+		case L'B':
+			b = 2;
+			c = *++n;
+			break;
+		case L'\0':
+			return 0;
+		default:
+			b = 8;
+		}
+	}
+	cutoff = 0xFFFFFFFF / b;
+	cutlim = 0xFFFFFFFF % b;
+	while (1) {
+		if (c >= L'0' && c <= L'9') {
+			d = c - L'0';
+		}
+		else if (c >= L'a' && c <= L'z') {
+			d = c - L'a' + 10;
+		}
+		else if (c >= L'A' && c <= L'Z') {
+			d = c - L'A' + 10;
+		}
+		else {
+			return c ? 0 : x;
+		}
+		if (d >= b || x > cutoff || (x == cutoff && d > cutlim)) {
+			return 0;
+		}
+		x = x * b + d;
+		c = *++n;
+	}
 }
 
 static UCHAR ParseSpec(LPCWSTR spec, PUCHAR pbChars) {
@@ -140,24 +203,17 @@ static UCHAR ParseSpec(LPCWSTR spec, PUCHAR pbChars) {
 }
 
 int main(void) {
+	UCHAR key[64];
 	UCHAR pbData[64];
 	UCHAR pbChars[94];
-	WCHAR username[CREDUI_MAX_USERNAME_LENGTH + 1] = L"";
-	WCHAR password[CREDUI_MAX_PASSWORD_LENGTH + 1] = L"";
 	DWORD error;
 	NTSTATUS status;
 	BCRYPT_HASH_HANDLE hHash = NULL;
 	HANDLE hOut;
-	ULONG cbData, n;
-	UCHAR cbChars, i, k, x;
+	DWORD cbData, n, i;
+	UCHAR cbChars, j, k, x;
 	int argc;
-	LPWSTR* argv = NULL;
-	_locale_t locale;
-	locale = _wcreate_locale(LC_ALL, L"C");
-	if (!locale) {
-		PRINT_ERROR("failed to create locale.\n");
-		goto cleanup;
-	}
+	LPWSTR* argv;
 	argv = CommandLineToArgvW(GetCommandLineW(), &argc);
 	if (argv == NULL) {
 		PrintErrorWin32(GetLastError());
@@ -166,33 +222,33 @@ int main(void) {
 	if (argc != 3) {
 		PRINT_ERROR(
 			"USAGE: hashforge <length> <chars>\n\n"
-			"hasforge is a command-line password manager that derives a strong password from credentials.\n"
-			"the user is prompted for credentials and a key is generated (same credentials = same key).\n"
-			"the key is then formatted into a password using the command line arguments:\n"
+			"`hasforge` is a command-line password manager that derives a strong password from credentials.\n"
+			"The user is prompted for credentials and a key is generated (same credentials = same key).\n"
+			"The key is then used to stream pseudorandom bytes which are formatted into a password using the command line arguments:\n"
 			" - <length>: number of characters.\n"
-			" - <chars> : allowed characters.\n"
-			"example: `hashforge 16 \"a-zA-Z0-9!@#\"`.\n\n"
-			"you can add single characters and ranges of characters in the <chars> string.\n"
-			"only printable ASCII characters are allowed (except space).\n"
-			"most characters simply represent themselves.\n"
-			"the notation \"a-b\" represents all characters within the range (\"b\" must collate after \"a\").\n"
-			"a backslash followed by any character represents that character.\n"
-			"it is an error if no character follows an unescaped backslash\n\n"
-			"ATTRIBUTIONS:\nthis project is heavily inspired by gnu-pw-mgr (but not nearly as good).\n"
-			"the rules of <chars> are a minimal version of the rules of GNU `tr` strings.\n"
+			" - <chars> : allowed characters.\n\n"
+			"Both single characters and ranges of characters can be added in the <chars> string.\n"
+			"Only printable ASCII characters are allowed (except space).\n"
+			"Most characters simply represent themselves.\n"
+			"The notation \"a-b\" represents all characters within the range (\"b\" must collate after \"a\").\n"
+			"A backslash followed by any character represents that character.\n"
+			"It is an error if no character follows an unescaped backslash\n\n"
+			"EXAMPLE: hashforge 16 \"a-zA-Z0-9!@#\"\n\n"
+			"ATTRIBUTIONS:\nThis project is heavily inspired by gnu-pw-mgr (but not nearly as good).\n"
+			"The rules of <chars> are a minimal version of the rules of GNU `tr` strings.\n"
 		);
 		goto cleanup;
 	}
-	n = _wcstoul_l(argv[1], NULL, 0, locale);
-	if (n == 0 || n == (ULONG)-1) {
-		PRINT_ERROR("ERROR: <length> is not recognized as a valid number.\n");
+	n = ParseUint(argv[1]);
+	if (n == 0) {
+		PRINT_ERROR("ERROR: <length> is 0 not recognized as a valid number.\n");
 		goto cleanup;
 	}
 	cbChars = ParseSpec(argv[2], pbChars);
 	if (cbChars == 0) {
 		PRINT_ERROR(
 			"ERROR: <chars> is not valid.\n\n"
-			"one of these events occured:\n"
+			"One of these events occured:\n"
 			" - no character was found.\n"
 			" - a space or a non-printable character was found.\n"
 			" - a bad range (like \"b-a\") was found.\n"
@@ -215,39 +271,45 @@ int main(void) {
 		PrintErrorWin32(error);
 		goto cleanup;
 	}
-	status = BCryptCreateHash(BCRYPT_CSHAKE256_ALG_HANDLE, &hHash, NULL, 0, NULL, 0, 0);
+	status = BCryptDeriveKeyPBKDF2(
+		BCRYPT_HMAC_SHA512_ALG_HANDLE,
+		(PUCHAR)password,
+		sizeof(password),
+		(PUCHAR)username,
+		sizeof(username),
+		100000,
+		key,
+		64,
+		0
+	);
 	if (!BCRYPT_SUCCESS(status)) {
-		PrintErrorStatus(status, "BCryptCreateHash");
-		goto cleanup;
-	}
-	status = BCryptSetProperty(hHash, BCRYPT_FUNCTION_NAME_STRING, (PUCHAR)L"KDF", sizeof(L"KDF"), 0);
-	if (!BCRYPT_SUCCESS(status)) {
-		PrintErrorStatus(status, "BCryptSetProperty");
-		goto cleanup;
-	}
-	status = BCryptSetProperty(hHash, BCRYPT_CUSTOMIZATION_STRING, (PUCHAR)username, (ULONG)wcslen(username) * sizeof(WCHAR) + sizeof(WCHAR), 0);
-	if (!BCRYPT_SUCCESS(status)) {
-		PrintErrorStatus(status, "BCryptSetProperty");
-		goto cleanup;
-	}
-	status = BCryptHashData(hHash, (PUCHAR)password, (ULONG)wcslen(password) * sizeof(WCHAR), 0);
-	if (!BCRYPT_SUCCESS(status)) {
-		PrintErrorStatus(status, "BCryptHashData");
+		PrintErrorStatus(status, "BCryptDeriveKeyPBKDF2");
 		goto cleanup;
 	}
 	SecureZeroMemory(username, sizeof(username));
 	SecureZeroMemory(password, sizeof(password));
+	status = BCryptCreateHash(BCRYPT_HMAC_SHA512_ALG_HANDLE, &hHash, NULL, 0, key, 64, BCRYPT_HASH_REUSABLE_FLAG);
+	if (!BCRYPT_SUCCESS(status)) {
+		PrintErrorStatus(status, "BCryptCreateHash");
+		goto cleanup;
+	}
 	hOut = GetStdHandle(STD_OUTPUT_HANDLE);
-	k = (UCHAR)(256 / cbChars) * cbChars;
+	k = 256 - (256 % (UCHAR)cbChars);
+	i = 0;
 	while (n) {
-		status = BCryptFinishHash(hHash, pbData, 64, BCRYPT_HASH_DONT_RESET_FLAG);
+		status = BCryptHashData(hHash, (PUCHAR)(&i), sizeof(i), 0);
+		if (!BCRYPT_SUCCESS(status)) {
+			PrintErrorStatus(status, "BCryptHashData");
+			goto cleanup;
+		}
+		status = BCryptFinishHash(hHash, pbData, 64, 0);
 		if (!BCRYPT_SUCCESS(status)) {
 			PrintErrorStatus(status, "BCryptFinishHash");
 			goto cleanup;
 		}
 		cbData = 0;
-		for (i = 0; i < 64; i++) {
-			x = pbData[i];
+		for (j = 0; j < 64; j++) {
+			x = pbData[j];
 			if (x < k) {
 				pbData[cbData++] = pbChars[x % cbChars];
 			}
@@ -257,19 +319,28 @@ int main(void) {
 			PrintErrorWin32(GetLastError());
 			goto cleanup;
 		}
+		++i;
 		n -= cbData;
 	}
+	SecureZeroMemory(key, sizeof(key));
+	SecureZeroMemory(pbData, sizeof(pbData));
 	BCryptDestroyHash(hHash);
 	LocalFree(argv);
-	_free_locale(locale);
 	return 0;
 cleanup:
 	SecureZeroMemory(username, sizeof(username));
 	SecureZeroMemory(password, sizeof(password));
+	SecureZeroMemory(key, sizeof(key));
+	SecureZeroMemory(pbData, sizeof(pbData));
 	if (hHash) {
 		BCryptDestroyHash(hHash);
 	}
 	LocalFree(argv);
-	_free_locale(locale);
 	return 1;
+}
+
+/* Optional entry point */
+void __stdcall entry(void) {
+	UINT r = (UINT)main();
+	ExitProcess(r);
 }
